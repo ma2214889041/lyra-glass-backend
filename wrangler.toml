@@ -1,0 +1,45 @@
+name = "lyra-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 自定义域名
+routes = [
+	{ pattern = "api.glass.lyrai.eu", custom_domain = true }
+]
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "lyra-db"
+database_id = "569b2047-c680-4b6f-9103-49dd6454e92a"
+
+# R2 存储绑定
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "ai-glass"
+preview_bucket_name = "ai-glass"
+
+# 环境变量（敏感信息使用 wrangler secret put）
+[vars]
+ADMIN_USERNAME = "admin"
+# 以下通过 wrangler secret put 设置:
+# ADMIN_PASSWORD
+# GEMINI_API_KEY
+
+# 定时任务 (Cron Triggers)
+[triggers]
+crons = ["*/5 * * * *", "0 3 * * *"]  # 每5分钟检查卡住的任务 + 每天凌晨3点清理过期数据
+
+# 开发环境配置
+[env.dev]
+name = "lyra-api-dev"
+
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "lyra-db-dev"
+database_id = "59b1e942-a4ca-49d3-a0d1-9bbdef1b5d5c"
+
+[[env.dev.r2_buckets]]
+binding = "R2"
+bucket_name = "lyra-storage-dev"

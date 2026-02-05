@@ -1,0 +1,22 @@
+{
+  "name": "lyra-workers",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:prod": "wrangler deploy --env production",
+    "db:migrate": "wrangler d1 execute lyra-db --file=./migrations/001_init.sql",
+    "db:migrate:dev": "wrangler d1 execute lyra-db-dev --file=./migrations/001_init.sql --local",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240117.0",
+    "typescript": "^5.3.0",
+    "wrangler": "^3.24.0"
+  }
+}
