@@ -1,6 +1,6 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { sessionDb, userDb } from './db';
-import type { Session } from './types';
+import type { Session, UserTier } from './types';
 
 /**
  * 生成随机 token (使用 Web Crypto API)
@@ -143,7 +143,7 @@ export async function register(
   return {
     success: true,
     token,
-    user: { id: user.id, username: user.username, role: user.role },
+    user: { id: user.id, username: user.username, role: user.role, tier: user.tier },
     expiresAt: session.expiresAt
   };
 }
@@ -174,7 +174,12 @@ export async function userLogin(
 
   return {
     token,
-    user: { id: user.id, username: user.username, role: user.role },
+    user: {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      tier: (user.tier as UserTier) || 'free'
+    },
     expiresAt: session.expiresAt
   };
 }
@@ -198,7 +203,7 @@ export async function adminLogin(
 
   return {
     token,
-    user: { id: null, username, role: 'admin' },
+    user: { id: null, username, role: 'admin', tier: 'ultra' as UserTier },
     expiresAt: session.expiresAt
   };
 }
@@ -281,7 +286,7 @@ export async function validateSession(db: D1Database, token: string): Promise<Se
 /**
  * 从请求头中提取 token
  */
-export function extractToken(authHeader: string | null): string | null {
+export function extractToken(authHeader: string | null | undefined): string | null {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return null;
   }

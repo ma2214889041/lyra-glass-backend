@@ -26,6 +26,22 @@ ADMIN_USERNAME = "admin"
 # 以下通过 wrangler secret put 设置:
 # ADMIN_PASSWORD
 # GEMINI_API_KEY
+# STRIPE_SECRET_KEY
+# STRIPE_WEBHOOK_SECRET
+
+# Cloudflare Queues 配置
+# 生产者绑定：发送消息到队列
+[[queues.producers]]
+queue = "generation-queue"
+binding = "GENERATION_QUEUE"
+
+# 消费者绑定：处理队列消息
+[[queues.consumers]]
+queue = "generation-queue"
+max_batch_size = 5
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "generation-dlq"
 
 # 定时任务 (Cron Triggers)
 [triggers]
@@ -43,3 +59,8 @@ database_id = "59b1e942-a4ca-49d3-a0d1-9bbdef1b5d5c"
 [[env.dev.r2_buckets]]
 binding = "R2"
 bucket_name = "lyra-storage-dev"
+
+# 开发环境 Queue（可选，本地开发时会回退到直接处理）
+# [[env.dev.queues.producers]]
+# queue = "generation-queue-dev"
+# binding = "GENERATION_QUEUE"

@@ -1,6 +1,7 @@
 import { Hono, Context, Next } from 'hono';
 import { cors } from 'hono/cors';
-import type { Env, Session } from './types';
+import type { Env, Session, QueueMessage } from './types';
+import { TIER_CONFIGS } from './types';
 
 // Hono Context 类型定义
 type AppContext = Context<{ Bindings: Env; Variables: Variables }>;
@@ -18,6 +19,10 @@ import {
 } from './gemini';
 import { processTask, processPendingTasks, processBatchTasks } from './task_processor';
 import { rateLimit } from './rateLimit';
+import {
+  createCheckoutSession, createPortalSession, handleWebhookEvent,
+  verifyWebhookSignature, getSubscriptionStatus, TIER_PRICES
+} from './stripe';
 
 // 扩展 Hono Context
 type Variables = {
@@ -294,6 +299,142 @@ app.delete('/api/tags/:id', adminMiddleware, async (c) => {
   } catch (error) {
     console.error('Delete tag error:', error);
     return c.json({ error: '删除标签失败' }, 500);
+  }
+});
+
+// ========== 订阅与支付 API ==========
+
+// 获取用户配额信息
+app.get('/api/user/quota', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user.userId) {
+      return c.json({ error: '用户未登录' }, 401);
+    }
+
+    const quota = await userDb.getQuota(c.env.DB, user.userId);
+    if (!quota) {
+      return c.json({ error: '用户不存在' }, 404);
+    }
+
+    return c.json({ success: true, ...quota });
+  } catch (error) {
+    console.error('Get quota error:', error);
+    return c.json({ error: '获取配额失败' }, 500);
+  }
+});
+
+// 获取订阅状态
+app.get('/api/subscription/status', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user.userId) {
+      return c.json({ error: '用户未登录' }, 401);
+    }
+
+    const status = await getSubscriptionStatus(c.env.DB, user.userId);
+    return c.json({ success: true, ...status });
+  } catch (error) {
+    console.error('Get subscription status error:', error);
+    return c.json({ error: '获取订阅状态失败' }, 500);
+  }
+});
+
+// 获取价格列表
+app.get('/api/subscription/prices', async (c) => {
+  return c.json({
+    success: true,
+    prices: TIER_PRICES
+  });
+});
+
+// 创建 Checkout Session
+app.post('/api/subscription/checkout', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user.userId) {
+      return c.json({ error: '用户未登录' }, 401);
+    }
+
+    const { priceId, email } = await c.req.json();
+    if (!priceId || !email) {
+      return c.json({ error: '缺少必要参数' }, 400);
+    }
+
+    const origin = c.req.header('origin') || 'https://glass.lyrai.eu';
+    const successUrl = `${origin}/settings?subscription=success`;
+    const cancelUrl = `${origin}/settings?subscription=cancelled`;
+
+    const session = await createCheckoutSession(
+      c.env.DB,
+      c.env.STRIPE_SECRET_KEY,
+      user.userId,
+      email,
+      priceId,
+      successUrl,
+      cancelUrl
+    );
+
+    return c.json({ success: true, ...session });
+  } catch (error: any) {
+    console.error('Create checkout session error:', error);
+    return c.json({ error: error.message || '创建支付会话失败' }, 500);
+  }
+});
+
+// 创建客户门户 Session
+app.post('/api/subscription/portal', authMiddleware, async (c) => {
+  try {
+    const user = c.get('user');
+    if (!user.userId) {
+      return c.json({ error: '用户未登录' }, 401);
+    }
+
+    const origin = c.req.header('origin') || 'https://glass.lyrai.eu';
+    const returnUrl = `${origin}/settings`;
+
+    const session = await createPortalSession(
+      c.env.DB,
+      c.env.STRIPE_SECRET_KEY,
+      user.userId,
+      returnUrl
+    );
+
+    return c.json({ success: true, ...session });
+  } catch (error: any) {
+    console.error('Create portal session error:', error);
+    return c.json({ error: error.message || '创建管理门户失败' }, 500);
+  }
+});
+
+// Stripe Webhook
+app.post('/api/webhooks/stripe', async (c) => {
+  try {
+    const signature = c.req.header('stripe-signature');
+    if (!signature) {
+      return c.json({ error: 'Missing signature' }, 400);
+    }
+
+    const payload = await c.req.text();
+
+    // 验证签名
+    const isValid = await verifyWebhookSignature(
+      payload,
+      signature,
+      c.env.STRIPE_WEBHOOK_SECRET
+    );
+
+    if (!isValid) {
+      return c.json({ error: 'Invalid signature' }, 400);
+    }
+
+    const event = JSON.parse(payload);
+    const result = await handleWebhookEvent(c.env.DB, event);
+
+    return c.json(result);
+  } catch (error: any) {
+    console.error('Webhook error:', error);
+    return c.json({ error: error.message }, 500);
   }
 });
 
@@ -656,15 +797,22 @@ app.get('/api/user/history', authMiddleware, async (c) => {
   try {
     const user = c.get('user');
     const view = c.req.query('view');
+    const cursor = c.req.query('cursor') || undefined;
+    const limit = parseInt(c.req.query('limit') || '50', 10);
 
-    let images;
+    let result;
     if (view === 'all' && user.role === 'admin') {
-      images = await imageDb.getByUserId(c.env.DB, null, 100);
+      result = await imageDb.getByUserId(c.env.DB, null, { cursor, limit: Math.min(limit, 100) });
     } else {
-      images = await imageDb.getByUserId(c.env.DB, user.userId, 50);
+      result = await imageDb.getByUserId(c.env.DB, user.userId, { cursor, limit: Math.min(limit, 50) });
     }
 
-    return c.json({ success: true, images });
+    return c.json({
+      success: true,
+      images: result.data,
+      nextCursor: result.nextCursor,
+      hasMore: result.hasMore
+    });
   } catch (error) {
     console.error('Get history error:', error);
     return c.json({ error: '获取历史记录失败' }, 500);
@@ -733,8 +881,20 @@ app.post('/api/user/history/:imageId/thumbnail', authMiddleware, async (c) => {
 // ========== 社区画廊 API ==========
 app.get('/api/gallery/public', async (c) => {
   try {
-    const images = await imageDb.getPublicImages(c.env.DB, 50);
-    return c.json({ success: true, images });
+    const cursor = c.req.query('cursor') || undefined;
+    const limit = parseInt(c.req.query('limit') || '50', 10);
+
+    const result = await imageDb.getPublicImages(c.env.DB, {
+      cursor,
+      limit: Math.min(limit, 100) // 最大 100 条
+    });
+
+    return c.json({
+      success: true,
+      images: result.data,
+      nextCursor: result.nextCursor,
+      hasMore: result.hasMore
+    });
   } catch (error) {
     console.error('Get public gallery error:', error);
     return c.json({ error: '获取社区作品失败' }, 500);
@@ -907,6 +1067,12 @@ app.post('/api/tasks/generate', rateLimit(10, 60 * 1000), authMiddleware, async 
     }
 
     const userId = user.userId ?? 0;
+
+    // 检查配额
+    const quotaResult = await userDb.consumeQuota(c.env.DB, userId, 1);
+    if (!quotaResult.success) {
+      return c.json({ error: quotaResult.error }, 403);
+    }
     const taskId = crypto.randomUUID();
     const task = await taskDb.create(c.env.DB, taskId, userId, 'generate', {
       imageBase64,
@@ -922,8 +1088,17 @@ app.post('/api/tasks/generate', rateLimit(10, 60 * 1000), authMiddleware, async 
 
     const stats = await taskDb.getQueueStats(c.env.DB);
 
-    // Trigger background processing
-    c.executionCtx.waitUntil(processTask(c.env, task.id));
+    // 发送到 Cloudflare Queue（如果可用）
+    if (c.env.GENERATION_QUEUE) {
+      await c.env.GENERATION_QUEUE.send({
+        taskId: task.id,
+        type: 'generate',
+        timestamp: Date.now()
+      });
+    } else {
+      // 回退到直接处理（开发环境或 Queue 未配置）
+      c.executionCtx.waitUntil(processTask(c.env, task.id));
+    }
 
     return c.json({
       success: true,
@@ -948,6 +1123,21 @@ app.post('/api/tasks/batch', rateLimit(3, 60 * 1000), authMiddleware, async (c) 
     }
 
     const userId = user.userId ?? 0;
+
+    // 检查等级的批量限制
+    const tierConfig = TIER_CONFIGS[user.tier || 'free'];
+    if (combinations.length > tierConfig.batchLimit) {
+      return c.json({
+        error: `您的等级最多支持${tierConfig.batchLimit}张批量生成，请升级会员或减少数量`
+      }, 403);
+    }
+
+    // 检查配额（批量任务消耗多个配额）
+    const quotaResult = await userDb.consumeQuota(c.env.DB, userId, combinations.length);
+    if (!quotaResult.success) {
+      return c.json({ error: quotaResult.error }, 403);
+    }
+
     const taskId = crypto.randomUUID();
 
     // 获取用户指定的并行数（1-5），默认3
@@ -966,8 +1156,17 @@ app.post('/api/tasks/batch', rateLimit(3, 60 * 1000), authMiddleware, async (c) 
 
     const stats = await taskDb.getQueueStats(c.env.DB);
 
-    // Trigger background processing
-    c.executionCtx.waitUntil(processTask(c.env, task.id));
+    // 发送到 Cloudflare Queue（如果可用）
+    if (c.env.GENERATION_QUEUE) {
+      await c.env.GENERATION_QUEUE.send({
+        taskId: task.id,
+        type: 'batch',
+        timestamp: Date.now()
+      });
+    } else {
+      // 回退到直接处理
+      c.executionCtx.waitUntil(processTask(c.env, task.id));
+    }
 
     return c.json({
       success: true,
@@ -992,7 +1191,19 @@ app.post('/api/tasks/product-shot', rateLimit(10, 60 * 1000), authMiddleware, as
       return c.json({ error: '缺少必要参数' }, 400);
     }
 
+    // 检查产品摄影功能权限
+    const tierConfig = TIER_CONFIGS[user.tier || 'free'];
+    if (!tierConfig.features.productShot) {
+      return c.json({ error: '产品摄影功能需要 Pro 或 Ultra 会员' }, 403);
+    }
+
     const userId = user.userId ?? 0;
+
+    // 检查配额
+    const quotaResult = await userDb.consumeQuota(c.env.DB, userId, angles.length);
+    if (!quotaResult.success) {
+      return c.json({ error: quotaResult.error }, 403);
+    }
     const batchId = crypto.randomUUID();
     const taskIds: string[] = [];
 
@@ -1013,15 +1224,27 @@ app.post('/api/tasks/product-shot', rateLimit(10, 60 * 1000), authMiddleware, as
       await taskDb.create(c.env.DB, taskId, userId, 'product_shot', {
         imageBase64,
         angle,
-        config: taskConfig
+        config: taskConfig,
+        concurrency
       }, batchId);
       taskIds.push(taskId);
     }
 
     const stats = await taskDb.getQueueStats(c.env.DB);
 
-    // 触发并发处理，使用用户指定的并行数
-    c.executionCtx.waitUntil(processBatchTasks(c.env, batchId, concurrency));
+    // 发送所有任务到 Queue（如果可用）
+    if (c.env.GENERATION_QUEUE) {
+      await Promise.all(taskIds.map(taskId =>
+        c.env.GENERATION_QUEUE.send({
+          taskId,
+          type: 'product_shot',
+          timestamp: Date.now()
+        })
+      ));
+    } else {
+      // 回退到直接处理
+      c.executionCtx.waitUntil(processBatchTasks(c.env, batchId, concurrency));
+    }
 
     return c.json({
       success: true,
@@ -1301,6 +1524,40 @@ app.get('/api/health', async (c) => {
 export default {
   fetch: app.fetch,
 
+  // Queue 消费者：处理生成任务
+  async queue(batch: MessageBatch<QueueMessage>, env: Env, ctx: ExecutionContext) {
+    console.log(`[Queue] Processing batch of ${batch.messages.length} messages`);
+
+    for (const message of batch.messages) {
+      const { taskId, type } = message.body;
+      console.log(`[Queue] Processing task ${taskId} (type: ${type})`);
+
+      try {
+        // 处理任务
+        await processTask(env, taskId);
+
+        // 确认消息已处理
+        message.ack();
+        console.log(`[Queue] Task ${taskId} completed successfully`);
+      } catch (error: any) {
+        console.error(`[Queue] Task ${taskId} failed:`, error);
+
+        // 更新任务状态为失败
+        await taskDb.fail(env.DB, taskId, error.message || '处理失败');
+
+        // 如果重试次数未用完，重新入队（通过不 ack 实现）
+        // Cloudflare Queues 会自动重试
+        if (message.attempts < 3) {
+          message.retry({ delaySeconds: Math.pow(2, message.attempts) * 10 }); // 指数退避：10s, 20s, 40s
+        } else {
+          // 超过重试次数，移到死信队列
+          message.ack();
+          console.error(`[Queue] Task ${taskId} moved to DLQ after ${message.attempts} attempts`);
+        }
+      }
+    }
+  },
+
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     const isDailyCleanup = event.cron === '0 3 * * *';
 
@@ -1310,9 +1567,12 @@ export default {
       console.log(`[Cron] Reset ${resetTasks} stuck tasks`);
     }
 
-    const processedCount = await processPendingTasks(env);
-    if (processedCount > 0) {
-      console.log(`[Cron] Processed ${processedCount} pending tasks`);
+    // 如果 Queue 未配置，继续使用轮询处理
+    if (!env.GENERATION_QUEUE) {
+      const processedCount = await processPendingTasks(env);
+      if (processedCount > 0) {
+        console.log(`[Cron] Processed ${processedCount} pending tasks`);
+      }
     }
 
     // Daily cleanup only (runs at 3 AM)

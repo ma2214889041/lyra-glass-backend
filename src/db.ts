@@ -1,11 +1,12 @@
 import type { D1Database } from '@cloudflare/workers-types';
-import type { Template, Tag, GeneratedImage, Task, Asset, Session, BatchProgress } from './types';
+import type { Template, Tag, GeneratedImage, Task, Asset, Session, BatchProgress, User, UserTier, UserQuota } from './types';
+import { TIER_CONFIGS } from './types';
 
 // ========== 标签操作 ==========
 export const tagDb = {
   getAll: async (db: D1Database): Promise<Tag[]> => {
     const { results } = await db.prepare('SELECT * FROM tags ORDER BY created_at ASC').all();
-    return results as Tag[];
+    return results as unknown as Tag[];
   },
 
   create: async (db: D1Database, tag: Partial<Tag>): Promise<Tag> => {
@@ -77,6 +78,7 @@ export const templateDb = {
       name: row.name as string,
       description: row.description as string,
       imageUrl: row.image_url as string,
+      thumbnailUrl: row.thumbnail_url as string | null,
       prompt: (row.prompt as string) || '',
       malePrompt: row.male_prompt as string | null,
       femalePrompt: row.female_prompt as string | null,
@@ -146,13 +148,14 @@ export const templateDb = {
 export const userDb = {
   create: async (db: D1Database, username: string, passwordHash: string) => {
     const result = await db.prepare(`
-      INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'user')
+      INSERT INTO users (username, password_hash, role, tier) VALUES (?, ?, 'user', 'free')
     `).bind(username, passwordHash).run();
 
     return {
       id: result.meta.last_row_id as number,
       username,
-      role: 'user' as const
+      role: 'user' as const,
+      tier: 'free' as UserTier
     };
   },
 
@@ -161,7 +164,11 @@ export const userDb = {
   },
 
   findById: async (db: D1Database, id: number) => {
-    return await db.prepare('SELECT id, username, role, created_at FROM users WHERE id = ?').bind(id).first();
+    return await db.prepare(`
+      SELECT id, username, role, tier, daily_generation_count, last_generation_date,
+             stripe_customer_id, stripe_subscription_id, subscription_status, subscription_ends_at, created_at
+      FROM users WHERE id = ?
+    `).bind(id).first();
   },
 
   usernameExists: async (db: D1Database, username: string): Promise<boolean> => {
@@ -172,6 +179,125 @@ export const userDb = {
   updatePassword: async (db: D1Database, userId: number, passwordHash: string): Promise<boolean> => {
     const result = await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
       .bind(passwordHash, userId).run();
+    return result.meta.changes > 0;
+  },
+
+  // ========== 等级与配额相关 ==========
+
+  // 获取用户配额信息
+  getQuota: async (db: D1Database, userId: number): Promise<UserQuota | null> => {
+    const row = await db.prepare(`
+      SELECT tier, daily_generation_count, last_generation_date FROM users WHERE id = ?
+    `).bind(userId).first();
+
+    if (!row) return null;
+
+    const tier = (row.tier as UserTier) || 'free';
+    const config = TIER_CONFIGS[tier];
+    const today = new Date().toISOString().slice(0, 10);
+    const lastDate = row.last_generation_date as string | null;
+
+    // 如果是新的一天，重置计数
+    const dailyUsed = lastDate === today ? (row.daily_generation_count as number) || 0 : 0;
+    const remaining = config.dailyLimit === -1 ? -1 : Math.max(0, config.dailyLimit - dailyUsed);
+
+    return {
+      tier,
+      dailyUsed,
+      dailyLimit: config.dailyLimit,
+      remaining,
+      features: config.features
+    };
+  },
+
+  // 检查并消费配额（返回是否成功）
+  consumeQuota: async (db: D1Database, userId: number, count: number = 1): Promise<{ success: boolean; error?: string }> => {
+    const quota = await userDb.getQuota(db, userId);
+    if (!quota) return { success: false, error: '用户不存在' };
+
+    // 无限制用户直接通过
+    if (quota.dailyLimit === -1) {
+      const today = new Date().toISOString().slice(0, 10);
+      await db.prepare(`
+        UPDATE users SET daily_generation_count = daily_generation_count + ?, last_generation_date = ?
+        WHERE id = ?
+      `).bind(count, today, userId).run();
+      return { success: true };
+    }
+
+    // 检查配额
+    if (quota.remaining < count) {
+      return {
+        success: false,
+        error: `今日生成次数已达上限（${quota.dailyLimit}次），请明天再试或升级会员`
+      };
+    }
+
+    // 消费配额
+    const today = new Date().toISOString().slice(0, 10);
+    await db.prepare(`
+      UPDATE users SET
+        daily_generation_count = CASE
+          WHEN last_generation_date = ? THEN daily_generation_count + ?
+          ELSE ?
+        END,
+        last_generation_date = ?
+      WHERE id = ?
+    `).bind(today, count, count, today, userId).run();
+
+    return { success: true };
+  },
+
+  // 更新用户等级
+  updateTier: async (db: D1Database, userId: number, tier: UserTier): Promise<boolean> => {
+    const result = await db.prepare('UPDATE users SET tier = ? WHERE id = ?')
+      .bind(tier, userId).run();
+    return result.meta.changes > 0;
+  },
+
+  // ========== Stripe 相关 ==========
+
+  // 更新 Stripe 客户 ID
+  updateStripeCustomer: async (db: D1Database, userId: number, customerId: string): Promise<boolean> => {
+    const result = await db.prepare('UPDATE users SET stripe_customer_id = ? WHERE id = ?')
+      .bind(customerId, userId).run();
+    return result.meta.changes > 0;
+  },
+
+  // 更新订阅信息
+  updateSubscription: async (
+    db: D1Database,
+    stripeCustomerId: string,
+    subscriptionId: string,
+    status: string,
+    tier: UserTier,
+    endsAt: number | null
+  ): Promise<boolean> => {
+    const result = await db.prepare(`
+      UPDATE users SET
+        stripe_subscription_id = ?,
+        subscription_status = ?,
+        tier = ?,
+        subscription_ends_at = ?
+      WHERE stripe_customer_id = ?
+    `).bind(subscriptionId, status, tier, endsAt, stripeCustomerId).run();
+    return result.meta.changes > 0;
+  },
+
+  // 通过 Stripe 客户 ID 查找用户
+  findByStripeCustomerId: async (db: D1Database, customerId: string) => {
+    return await db.prepare('SELECT * FROM users WHERE stripe_customer_id = ?').bind(customerId).first();
+  },
+
+  // 取消订阅（降级到免费）
+  cancelSubscription: async (db: D1Database, stripeCustomerId: string): Promise<boolean> => {
+    const result = await db.prepare(`
+      UPDATE users SET
+        tier = 'free',
+        subscription_status = 'cancelled',
+        stripe_subscription_id = NULL
+      WHERE stripe_customer_id = ?
+    `).bind(stripeCustomerId).run();
     return result.meta.changes > 0;
   }
 };
@@ -194,19 +320,23 @@ export const sessionDb = {
       VALUES (?, ?, ?, ?, ?, ?)
     `).bind(token, username, userId, role, now, expiresAt).run();
 
-    return { username, userId, role: role as 'user' | 'admin', expiresAt };
+    return { username, userId, role: role as 'user' | 'admin', tier: 'free' as UserTier, expiresAt };
   },
 
   validate: async (db: D1Database, token: string): Promise<Session | null> => {
     const now = Math.floor(Date.now() / 1000);
-    const row = await db.prepare('SELECT * FROM sessions WHERE token = ? AND expires_at > ?')
-      .bind(token, now).first();
+    const row = await db.prepare(`
+      SELECT s.*, u.tier FROM sessions s
+      LEFT JOIN users u ON s.user_id = u.id
+      WHERE s.token = ? AND s.expires_at > ?
+    `).bind(token, now).first();
 
     if (!row) return null;
     return {
       username: row.username as string,
       userId: row.user_id as number | null,
       role: (row.role as 'user' | 'admin') || 'admin',
+      tier: (row.tier as UserTier) || 'free',
       expiresAt: row.expires_at as number
     };
   },
@@ -224,6 +354,14 @@ export const sessionDb = {
 };
 
 // ========== 图片记录操作 ==========
+
+// 游标分页返回类型
+export interface CursorPaginatedResult<T> {
+  data: T[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
 export const imageDb = {
   save: async (db: D1Database, image: Partial<GeneratedImage>, userId: number | null, parentImageId?: string) => {
     await db.prepare(`
@@ -243,21 +381,45 @@ export const imageDb = {
     return { ...image, userId, parentImageId };
   },
 
-  getByUserId: async (db: D1Database, userId: number | null, limit: number = 50): Promise<GeneratedImage[]> => {
+  /**
+   * 获取用户历史记录（游标分页）
+   * @param cursor - 上一页最后一条记录的 created_at（Unix timestamp，秒）
+   */
+  getByUserId: async (
+    db: D1Database,
+    userId: number | null,
+    options: { cursor?: string; limit?: number } = {}
+  ): Promise<CursorPaginatedResult<GeneratedImage>> => {
+    const limit = options.limit || 50;
+    const cursor = options.cursor ? parseInt(options.cursor, 10) : null;
+
     let query: string;
     let params: (number | null)[];
 
     if (userId === null) {
-      query = `SELECT * FROM generated_images ORDER BY created_at DESC LIMIT ?`;
-      params = [limit];
+      // 管理员查看所有
+      if (cursor) {
+        query = `SELECT * FROM generated_images WHERE created_at < ? ORDER BY created_at DESC LIMIT ?`;
+        params = [cursor, limit + 1]; // 多取一条判断是否有更多
+      } else {
+        query = `SELECT * FROM generated_images ORDER BY created_at DESC LIMIT ?`;
+        params = [limit + 1];
+      }
     } else {
-      query = `SELECT * FROM generated_images WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`;
-      params = [userId, limit];
+      // 普通用户查看自己的
+      if (cursor) {
+        query = `SELECT * FROM generated_images WHERE user_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`;
+        params = [userId, cursor, limit + 1];
+      } else {
+        query = `SELECT * FROM generated_images WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`;
+        params = [userId, limit + 1];
+      }
     }
 
     const { results } = await db.prepare(query).bind(...params).all();
 
-    return results.map((row: any) => ({
+    const hasMore = results.length > limit;
+    const data = (hasMore ? results.slice(0, limit) : results).map((row: any) => ({
       id: row.id,
       url: row.url,
       thumbnailUrl: row.thumbnail_url,
@@ -268,6 +430,13 @@ export const imageDb = {
       isPublic: row.is_public === 1,
       timestamp: row.created_at * 1000
     }));
+
+    // 下一个游标是最后一条记录的 created_at
+    const nextCursor = hasMore && data.length > 0
+      ? String(Math.floor(data[data.length - 1].timestamp / 1000))
+      : null;
+
+    return { data, nextCursor, hasMore };
   },
 
   getById: async (db: D1Database, imageId: string) => {
@@ -299,15 +468,42 @@ export const imageDb = {
     return result.meta.changes > 0;
   },
 
-  getPublicImages: async (db: D1Database, limit: number = 50) => {
-    const { results } = await db.prepare(`
-      SELECT gi.*, u.username FROM generated_images gi
-      LEFT JOIN users u ON gi.user_id = u.id
-      WHERE gi.is_public = 1
-      ORDER BY gi.created_at DESC LIMIT ?
-    `).bind(limit).all();
+  /**
+   * 获取公开画廊图片（游标分页）
+   * @param cursor - 上一页最后一条记录的 created_at（Unix timestamp，秒）
+   */
+  getPublicImages: async (
+    db: D1Database,
+    options: { cursor?: string; limit?: number } = {}
+  ): Promise<CursorPaginatedResult<GeneratedImage & { username: string }>> => {
+    const limit = options.limit || 50;
+    const cursor = options.cursor ? parseInt(options.cursor, 10) : null;
 
-    return results.map((row: any) => ({
+    let query: string;
+    let params: (number | null)[];
+
+    if (cursor) {
+      query = `
+        SELECT gi.*, u.username FROM generated_images gi
+        LEFT JOIN users u ON gi.user_id = u.id
+        WHERE gi.is_public = 1 AND gi.created_at < ?
+        ORDER BY gi.created_at DESC LIMIT ?
+      `;
+      params = [cursor, limit + 1];
+    } else {
+      query = `
+        SELECT gi.*, u.username FROM generated_images gi
+        LEFT JOIN users u ON gi.user_id = u.id
+        WHERE gi.is_public = 1
+        ORDER BY gi.created_at DESC LIMIT ?
+      `;
+      params = [limit + 1];
+    }
+
+    const { results } = await db.prepare(query).bind(...params).all();
+
+    const hasMore = results.length > limit;
+    const data = (hasMore ? results.slice(0, limit) : results).map((row: any) => ({
       id: row.id,
       url: row.url,
       thumbnailUrl: row.thumbnail_url,
@@ -316,8 +512,15 @@ export const imageDb = {
       prompt: row.prompt,
       timestamp: row.created_at * 1000,
       isPublic: true,
+      userId: row.user_id,
       username: row.username || '匿名用户'
     }));
+
+    const nextCursor = hasMore && data.length > 0
+      ? String(Math.floor(data[data.length - 1].timestamp / 1000))
+      : null;
+
+    return { data, nextCursor, hasMore };
   },
 
   setPublic: async (db: D1Database, imageId: string, isPublic: boolean, userId: number) => {
