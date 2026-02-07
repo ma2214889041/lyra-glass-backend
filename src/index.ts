@@ -68,6 +68,33 @@ app.use('*', cors({
   credentials: true,
 }));
 
+// 全局错误处理中间件
+app.onError((err, c) => {
+  console.error(`[Global Error] ${c.req.method} ${c.req.path}:`, err);
+
+  // 区分不同类型的错误
+  if (err.message.includes('GEMINI_API_KEY')) {
+    return c.json({ error: 'API 配置错误，请联系管理员' }, 500);
+  }
+  if (err.message.includes('Gemini API')) {
+    return c.json({ error: 'AI 服务暂时不可用，请稍后重试' }, 503);
+  }
+  if (err.message.includes('D1') || err.message.includes('database')) {
+    return c.json({ error: '数据库错误，请稍后重试' }, 500);
+  }
+  if (err.message.includes('R2')) {
+    return c.json({ error: '存储服务错误，请稍后重试' }, 500);
+  }
+
+  // 默认错误响应（生产环境不暴露详细错误信息）
+  return c.json({ error: '服务器内部错误' }, 500);
+});
+
+// 404 处理
+app.notFound((c) => {
+  return c.json({ error: '接口不存在' }, 404);
+});
+
 // 认证中间件
 const authMiddleware = async (c: AppContext, next: Next) => {
   const token = extractToken(c.req.header('Authorization'));

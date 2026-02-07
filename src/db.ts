@@ -7,6 +7,19 @@ const CDN_DOMAIN = 'https://cdn.lyrai.eu';
 const IMAGE_RESIZING_PATH = '/cdn-cgi/image';
 
 /**
+ * 安全的 JSON 解析，失败时返回默认值
+ */
+function safeJsonParse<T>(value: string | null | undefined, defaultValue: T): T {
+  if (!value) return defaultValue;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    console.warn('[safeJsonParse] Failed to parse:', value?.slice(0, 100));
+    return defaultValue;
+  }
+}
+
+/**
  * 生成 R2 CDN 直连 URL
  * @param path R2 路径 (如 /r2/assets/xxx.png)
  */
@@ -33,7 +46,8 @@ function getResizedImageUrl(path: string | null, width = 400, quality = 75): str
 // ========== 标签操作 ==========
 export const tagDb = {
   getAll: async (db: D1Database): Promise<Tag[]> => {
-    const { results } = await db.prepare('SELECT * FROM tags ORDER BY created_at ASC').all();
+    // 优化：只查询需要的字段
+    const { results } = await db.prepare('SELECT id, name, color FROM tags ORDER BY created_at ASC').all();
     return results as unknown as Tag[];
   },
 
@@ -67,15 +81,41 @@ export const templateDb = {
     const limit = options?.limit || 12;
     const offset = (page - 1) * limit;
 
+    // 优化：使用 SQL 层面的标签过滤，而不是内存过滤
+    let query: string;
+    let countQuery: string;
+    const bindings: any[] = [];
+
+    if (options?.tagFilter) {
+      // 使用 json_each 在 SQL 层过滤标签
+      countQuery = `SELECT COUNT(*) as count FROM templates WHERE EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)`;
+      query = `SELECT id, name, description, image_url, prompt, male_prompt, female_prompt, 
+               default_gender, default_framing, tags, variables 
+               FROM templates 
+               WHERE EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)
+               ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?`;
+      bindings.push(options.tagFilter);
+    } else {
+      countQuery = 'SELECT COUNT(*) as count FROM templates';
+      query = `SELECT id, name, description, image_url, prompt, male_prompt, female_prompt, 
+               default_gender, default_framing, tags, variables 
+               FROM templates ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?`;
+    }
+
     // 获取总数
-    const countResult = await db.prepare('SELECT COUNT(*) as count FROM templates').first<{ count: number }>();
+    const countStmt = options?.tagFilter
+      ? db.prepare(countQuery).bind(options.tagFilter)
+      : db.prepare(countQuery);
+    const countResult = await countStmt.first<{ count: number }>();
     const total = countResult?.count || 0;
 
     // 获取分页数据
-    const { results } = await db.prepare('SELECT * FROM templates ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?')
-      .bind(limit, offset).all();
+    const dataStmt = options?.tagFilter
+      ? db.prepare(query).bind(options.tagFilter, limit, offset)
+      : db.prepare(query).bind(limit, offset);
+    const { results } = await dataStmt.all();
 
-    let templates = results.map((row: any) => ({
+    const templates = results.map((row: any) => ({
       id: row.id,
       name: row.name,
       description: row.description,
@@ -88,13 +128,10 @@ export const templateDb = {
       femalePrompt: row.female_prompt || null,
       defaultGender: row.default_gender || 'female',
       defaultFraming: row.default_framing || 'Close-up',
-      tags: JSON.parse(row.tags || '[]'),
-      variables: JSON.parse(row.variables || '[]')
+      // 使用安全 JSON 解析
+      tags: safeJsonParse<string[]>(row.tags, []),
+      variables: safeJsonParse<any[]>(row.variables, [])
     })) as Template[];
-
-    if (options?.tagFilter) {
-      templates = templates.filter(tpl => tpl.tags.includes(options.tagFilter!));
-    }
 
     return { data: templates, total, page, limit };
   },
@@ -428,21 +465,25 @@ export const imageDb = {
     let params: (number | null)[];
 
     if (userId === null) {
-      // 管理员查看所有
+      // 管理员查看所有 - 优化：列表页只查询必要字段
       if (cursor) {
-        query = `SELECT * FROM generated_images WHERE created_at < ? ORDER BY created_at DESC LIMIT ?`;
-        params = [cursor, limit + 1]; // 多取一条判断是否有更多
+        query = `SELECT id, url, thumbnail_url, type, user_id, is_public, created_at 
+                 FROM generated_images WHERE created_at < ? ORDER BY created_at DESC LIMIT ?`;
+        params = [cursor, limit + 1];
       } else {
-        query = `SELECT * FROM generated_images ORDER BY created_at DESC LIMIT ?`;
+        query = `SELECT id, url, thumbnail_url, type, user_id, is_public, created_at 
+                 FROM generated_images ORDER BY created_at DESC LIMIT ?`;
         params = [limit + 1];
       }
     } else {
-      // 普通用户查看自己的
+      // 普通用户查看自己的 - 优化：列表页只查询必要字段
       if (cursor) {
-        query = `SELECT * FROM generated_images WHERE user_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`;
+        query = `SELECT id, url, thumbnail_url, type, user_id, is_public, created_at 
+                 FROM generated_images WHERE user_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`;
         params = [userId, cursor, limit + 1];
       } else {
-        query = `SELECT * FROM generated_images WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`;
+        query = `SELECT id, url, thumbnail_url, type, user_id, is_public, created_at 
+                 FROM generated_images WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`;
         params = [userId, limit + 1];
       }
     }
@@ -455,8 +496,9 @@ export const imageDb = {
       url: row.url,
       thumbnailUrl: row.thumbnail_url,
       type: row.type,
-      config: row.config ? JSON.parse(row.config) : null,
-      prompt: row.prompt,
+      // config 和 prompt 在列表页不需要，设为 null
+      config: null,
+      prompt: null,
       userId: row.user_id,
       isPublic: row.is_public === 1,
       timestamp: row.created_at * 1000
@@ -513,9 +555,11 @@ export const imageDb = {
     let query: string;
     let params: (number | null)[];
 
+    // 优化：列表页只查询必要字段，不查询 config/prompt 等大字段
     if (cursor) {
       query = `
-        SELECT gi.*, u.username FROM generated_images gi
+        SELECT gi.id, gi.url, gi.thumbnail_url, gi.type, gi.user_id, gi.is_public, gi.created_at, u.username 
+        FROM generated_images gi
         LEFT JOIN users u ON gi.user_id = u.id
         WHERE gi.is_public = 1 AND gi.created_at < ?
         ORDER BY gi.created_at DESC LIMIT ?
@@ -523,7 +567,8 @@ export const imageDb = {
       params = [cursor, limit + 1];
     } else {
       query = `
-        SELECT gi.*, u.username FROM generated_images gi
+        SELECT gi.id, gi.url, gi.thumbnail_url, gi.type, gi.user_id, gi.is_public, gi.created_at, u.username 
+        FROM generated_images gi
         LEFT JOIN users u ON gi.user_id = u.id
         WHERE gi.is_public = 1
         ORDER BY gi.created_at DESC LIMIT ?
@@ -539,8 +584,9 @@ export const imageDb = {
       url: row.url,
       thumbnailUrl: row.thumbnail_url,
       type: row.type,
-      config: row.config ? JSON.parse(row.config) : null,
-      prompt: row.prompt,
+      // config 和 prompt 在列表页不需要
+      config: null,
+      prompt: null,
       timestamp: row.created_at * 1000,
       isPublic: true,
       userId: row.user_id,

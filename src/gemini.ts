@@ -119,7 +119,8 @@ async function callGeminiAPI(
     throw new Error('GEMINI_API_KEY 未配置');
   }
 
-  const url = `${GEMINI_API_BASE}/${model}:generateContent?key=${apiKey}`;
+  // 使用 Header 传递 API Key，避免在 URL 中暴露（更安全，不会被日志记录）
+  const url = `${GEMINI_API_BASE}/${model}:generateContent`;
 
   const requestBody: any = {
     contents: [{ parts: contents.parts }]
@@ -153,7 +154,8 @@ async function callGeminiAPI(
   const response = await fetch(url, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'x-goog-api-key': apiKey  // API Key 在 Header 中传递，不会被 URL 日志记录
     },
     body: JSON.stringify(requestBody)
   });
