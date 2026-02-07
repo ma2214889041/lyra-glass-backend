@@ -20,6 +20,12 @@ binding = "R2"
 bucket_name = "ai-glass"
 preview_bucket_name = "ai-glass"
 
+# Session 缓存 KV
+[[kv_namespaces]]
+binding = "SESSION_KV"
+id = "76f4076c901b4c94a3de0eba84c2abcb"
+
+
 # 环境变量（敏感信息使用 wrangler secret put）
 [vars]
 ADMIN_USERNAME = "admin"
@@ -42,6 +48,17 @@ max_batch_size = 5
 max_batch_timeout = 30
 max_retries = 3
 dead_letter_queue = "generation-dlq"
+
+# Durable Objects
+[durable_objects]
+bindings = [
+  { name = "TASK_MONITOR", class_name = "TaskMonitor" }
+]
+
+# Migrations
+[[migrations]]
+tag = "v1"
+new_classes = ["TaskMonitor"]
 
 # 定时任务 (Cron Triggers)
 [triggers]

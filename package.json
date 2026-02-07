@@ -12,7 +12,10 @@
     "tail": "wrangler tail"
   },
   "dependencies": {
-    "hono": "^4.0.0"
+    "@hono/zod-validator": "^0.7.6",
+    "drizzle-orm": "^0.45.1",
+    "hono": "^4.0.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240117.0",

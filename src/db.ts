@@ -2,6 +2,34 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { Template, Tag, GeneratedImage, Task, Asset, Session, BatchProgress, User, UserTier, UserQuota } from './types';
 import { TIER_CONFIGS } from './types';
 
+// CDN 配置
+const CDN_DOMAIN = 'https://cdn.lyrai.eu';
+const IMAGE_RESIZING_PATH = '/cdn-cgi/image';
+
+/**
+ * 生成 R2 CDN 直连 URL
+ * @param path R2 路径 (如 /r2/assets/xxx.png)
+ */
+function getCdnUrl(path: string | null): string | null {
+  if (!path) return null;
+  // 从 /r2/xxx 中提取实际路径
+  const key = path.startsWith('/r2/') ? path.slice(4) : path;
+  return `${CDN_DOMAIN}/${key}`;
+}
+
+/**
+ * 生成 Cloudflare Image Resizing URL
+ * @param path R2 路径 (如 /r2/assets/xxx.png)
+ * @param width 图片宽度
+ * @param quality 图片质量
+ */
+function getResizedImageUrl(path: string | null, width = 400, quality = 75): string | null {
+  if (!path) return null;
+  // 从 /r2/xxx 中提取实际路径
+  const key = path.startsWith('/r2/') ? path.slice(4) : path;
+  return `${CDN_DOMAIN}${IMAGE_RESIZING_PATH}/width=${width},quality=${quality},format=webp/${key}`;
+}
+
 // ========== 标签操作 ==========
 export const tagDb = {
   getAll: async (db: D1Database): Promise<Tag[]> => {
@@ -51,8 +79,10 @@ export const templateDb = {
       id: row.id,
       name: row.name,
       description: row.description,
-      imageUrl: row.image_url,
-      thumbnailUrl: row.thumbnail_url || null,
+      // 使用 R2 CDN 直连
+      imageUrl: getCdnUrl(row.image_url),
+      // 使用 Cloudflare Image Resizing 生成缩略图 URL
+      thumbnailUrl: getResizedImageUrl(row.image_url),
       prompt: row.prompt || '',
       malePrompt: row.male_prompt || null,
       femalePrompt: row.female_prompt || null,
@@ -77,8 +107,9 @@ export const templateDb = {
       id: row.id as string,
       name: row.name as string,
       description: row.description as string,
-      imageUrl: row.image_url as string,
-      thumbnailUrl: row.thumbnail_url as string | null,
+      // 使用 R2 CDN 直连
+      imageUrl: getCdnUrl(row.image_url as string) || (row.image_url as string),
+      thumbnailUrl: getResizedImageUrl(row.image_url as string),
       prompt: (row.prompt as string) || '',
       malePrompt: row.male_prompt as string | null,
       femalePrompt: row.female_prompt as string | null,

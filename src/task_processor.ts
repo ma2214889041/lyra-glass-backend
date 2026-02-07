@@ -87,12 +87,16 @@ export async function processTask(env: Env, taskId: string): Promise<boolean> {
                 createdCount++;
             }
 
-            await taskDb.complete(env.DB, taskId, {
+            const result = {
                 success: true,
                 batchId,
                 subTaskCount: createdCount,
                 message: `Successfully created ${createdCount} generation tasks`
-            });
+            };
+            await taskDb.complete(env.DB, taskId, result);
+
+            // Broadcast success
+            await broadcastTaskUpdate(env, taskId, { status: 'completed', output: result });
 
             // 触发批次任务的并发处理，使用用户设置的并行数
             await processBatchTasks(env, batchId, concurrency);
@@ -144,14 +148,19 @@ export async function processTask(env: Env, taskId: string): Promise<boolean> {
                 prompt: null
             }, userId);
 
-            // 完成任务
-            await taskDb.complete(env.DB, taskId, {
+            const result = {
                 success: true,
                 angle,
                 imageUrl: url,
                 thumbnailUrl,
                 imageId
-            });
+            };
+
+            // 完成任务
+            await taskDb.complete(env.DB, taskId, result);
+
+            // Broadcast success
+            await broadcastTaskUpdate(env, taskId, { status: 'completed', output: result });
 
             console.log(`[ProductShot] Completed angle: ${angle}`);
             return true;
@@ -230,20 +239,41 @@ export async function processTask(env: Env, taskId: string): Promise<boolean> {
             prompt: savePrompt
         }, userId);
 
-        // Complete Task
-        await taskDb.complete(env.DB, taskId, {
+        const result = {
             success: true,
             imageUrl: url,
             thumbnailUrl,
             imageId
-        });
+        };
+
+        // Complete Task
+        await taskDb.complete(env.DB, taskId, result);
+
+        // Broadcast success
+        await broadcastTaskUpdate(env, taskId, { status: 'completed', output: result });
 
         return true;
 
     } catch (error: any) {
         console.error(`Task ${taskId} failed:`, error);
         await taskDb.fail(env.DB, taskId, error.message || 'Processing failed');
+        // Broadcast failure
+        await broadcastTaskUpdate(env, taskId, { status: 'failed', error: error.message || 'Processing failed' });
         return false;
+    }
+}
+
+// Helper to broadcast task updates
+async function broadcastTaskUpdate(env: Env, taskId: string, status: any) {
+    try {
+        const id = env.TASK_MONITOR.idFromName(taskId);
+        const stub = env.TASK_MONITOR.get(id);
+        await stub.fetch(new Request("http://do/broadcast", {
+            method: "POST",
+            body: JSON.stringify(status)
+        }));
+    } catch (e) {
+        console.error(`Failed to broadcast task update for ${taskId}:`, e);
     }
 }
 

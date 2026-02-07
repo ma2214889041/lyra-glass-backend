@@ -2,6 +2,7 @@
 export interface Env {
   DB: D1Database;
   R2: R2Bucket;
+  SESSION_KV: KVNamespace;
   GENERATION_QUEUE: Queue<QueueMessage>;
   ADMIN_USERNAME: string;
   ADMIN_PASSWORD: string;
@@ -9,7 +10,9 @@ export interface Env {
   // Stripe
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
+  TASK_MONITOR: DurableObjectNamespace;
 }
+
 
 // 用户等级类型
 export type UserTier = 'free' | 'pro' | 'ultra';

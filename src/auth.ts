@@ -1,6 +1,9 @@
-import type { D1Database } from '@cloudflare/workers-types';
+import type { D1Database, KVNamespace } from '@cloudflare/workers-types';
 import { sessionDb, userDb } from './db';
 import type { Session, UserTier } from './types';
+
+// KV 缓存 TTL（与 session 过期时间一致）
+const SESSION_KV_TTL = 7 * 24 * 60 * 60; // 7天（秒）
 
 /**
  * 生成随机 token (使用 Web Crypto API)
@@ -111,6 +114,7 @@ export function validateAdminCredentials(
  */
 export async function register(
   db: D1Database,
+  kv: KVNamespace,
   username: string,
   password: string
 ) {
@@ -119,18 +123,8 @@ export async function register(
     return { error: '用户名已存在' };
   }
 
-  // 用户名验证
-  if (username.length < 3 || username.length > 20) {
-    return { error: '用户名长度需在3-20字符之间' };
-  }
-  if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)) {
-    return { error: '用户名只能包含字母、数字、下划线和中文' };
-  }
-
-  // 密码验证
-  if (password.length < 6) {
-    return { error: '密码长度至少6位' };
-  }
+  // Note: Input validation is now handled by Zod middleware in index.ts
+  // No need to validate username/password format here
 
   // 创建用户
   const passwordHash = await hashPassword(password);
@@ -139,6 +133,18 @@ export async function register(
   // 自动登录
   const token = generateToken();
   const session = await sessionDb.create(db, token, username, 24 * 7, user.id, 'user');
+
+  // 写入 KV 缓存
+  const sessionData: Session = {
+    username,
+    userId: user.id,
+    role: 'user',
+    tier: user.tier,
+    expiresAt: session.expiresAt
+  };
+  await kv.put(`session:${token}`, JSON.stringify(sessionData), {
+    expirationTtl: SESSION_KV_TTL
+  });
 
   return {
     success: true,
@@ -153,6 +159,7 @@ export async function register(
  */
 export async function userLogin(
   db: D1Database,
+  kv: KVNamespace,
   username: string,
   password: string
 ) {
@@ -172,13 +179,26 @@ export async function userLogin(
     user.role as string
   );
 
+  // 写入 KV 缓存
+  const tier = (user.tier as UserTier) || 'free';
+  const sessionData: Session = {
+    username,
+    userId: user.id as number,
+    role: user.role as 'user' | 'admin',
+    tier,
+    expiresAt: session.expiresAt
+  };
+  await kv.put(`session:${token}`, JSON.stringify(sessionData), {
+    expirationTtl: SESSION_KV_TTL
+  });
+
   return {
     token,
     user: {
       id: user.id,
       username: user.username,
       role: user.role,
-      tier: (user.tier as UserTier) || 'free'
+      tier
     },
     expiresAt: session.expiresAt
   };
@@ -189,6 +209,7 @@ export async function userLogin(
  */
 export async function adminLogin(
   db: D1Database,
+  kv: KVNamespace,
   username: string,
   password: string,
   adminUsername: string,
@@ -200,6 +221,18 @@ export async function adminLogin(
 
   const token = generateToken();
   const session = await sessionDb.create(db, token, username, 24, null, 'admin');
+
+  // 写入 KV 缓存
+  const sessionData: Session = {
+    username,
+    userId: null,
+    role: 'admin',
+    tier: 'ultra' as UserTier,
+    expiresAt: session.expiresAt
+  };
+  await kv.put(`session:${token}`, JSON.stringify(sessionData), {
+    expirationTtl: 24 * 60 * 60 // 管理员 24 小时
+  });
 
   return {
     token,
@@ -213,17 +246,18 @@ export async function adminLogin(
  */
 export async function login(
   db: D1Database,
+  kv: KVNamespace,
   username: string,
   password: string,
   adminUsername: string,
   adminPassword: string
 ) {
   // 先尝试普通用户登录
-  const userResult = await userLogin(db, username, password);
+  const userResult = await userLogin(db, kv, username, password);
   if (userResult) return userResult;
 
   // 再尝试管理员登录
-  const adminResult = await adminLogin(db, username, password, adminUsername, adminPassword);
+  const adminResult = await adminLogin(db, kv, username, password, adminUsername, adminPassword);
   if (adminResult) return adminResult;
 
   return null;
@@ -254,10 +288,7 @@ export async function changePassword(
     return { error: '当前密码错误' };
   }
 
-  // 验证新密码
-  if (newPassword.length < 6) {
-    return { error: '新密码长度至少6位' };
-  }
+  // Note: New password validation is now handled by Zod middleware
 
   // 更新密码
   const newHash = await hashPassword(newPassword);
@@ -272,15 +303,57 @@ export async function changePassword(
 /**
  * 登出
  */
-export async function logout(db: D1Database, token: string): Promise<boolean> {
+export async function logout(db: D1Database, kv: KVNamespace, token: string): Promise<boolean> {
+  // 同时从 D1 和 KV 删除
+  await kv.delete(`session:${token}`);
   return sessionDb.delete(db, token);
 }
 
 /**
- * 验证 session
+ * 验证 session（KV 优先，减少 D1 读取）
  */
-export async function validateSession(db: D1Database, token: string): Promise<Session | null> {
-  return sessionDb.validate(db, token);
+export async function validateSession(
+  db: D1Database,
+  kv: KVNamespace,
+  token: string
+): Promise<Session | null> {
+  const now = Math.floor(Date.now() / 1000);
+
+  // 1. 先查 KV 缓存
+  try {
+    const cached = await kv.get(`session:${token}`, 'json');
+    if (cached) {
+      const session = cached as Session;
+      // 检查是否过期
+      if (session.expiresAt > now) {
+        return session;
+      }
+      // 过期则删除 KV 缓存
+      await kv.delete(`session:${token}`);
+    }
+  } catch (e) {
+    // KV 读取失败，继续查 D1
+    console.error('KV read error:', e);
+  }
+
+  // 2. KV 未命中，查 D1
+  const session = await sessionDb.validate(db, token);
+  if (!session) return null;
+
+  // 3. 回写 KV（计算剩余 TTL）
+  const remainingTtl = session.expiresAt - now;
+  if (remainingTtl > 0) {
+    try {
+      await kv.put(`session:${token}`, JSON.stringify(session), {
+        expirationTtl: remainingTtl
+      });
+    } catch (e) {
+      // KV 写入失败，不影响正常流程
+      console.error('KV write error:', e);
+    }
+  }
+
+  return session;
 }
 
 /**

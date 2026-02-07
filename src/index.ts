@@ -1,7 +1,16 @@
 import { Hono, Context, Next } from 'hono';
 import { cors } from 'hono/cors';
+import { zValidator } from '@hono/zod-validator';
 import type { Env, Session, QueueMessage } from './types';
 import { TIER_CONFIGS } from './types';
+import {
+  registerSchema, loginSchema, changePasswordSchema,
+  createTemplateSchema, updateTemplateSchema,
+  createTagSchema, updateTagSchema,
+  generateTemplateSchema, generateIterateSchema,
+  setPublicSchema, submitFeedbackSchema,
+  getFirstError
+} from './validators';
 
 // Hono Context 类型定义
 type AppContext = Context<{ Bindings: Env; Variables: Variables }>;
@@ -66,7 +75,7 @@ const authMiddleware = async (c: AppContext, next: Next) => {
     return c.json({ error: '未授权访问' }, 401);
   }
 
-  const session = await validateSession(c.env.DB, token);
+  const session = await validateSession(c.env.DB, c.env.SESSION_KV, token);
   if (!session) {
     return c.json({ error: 'Session 已过期，请重新登录' }, 401);
   }
@@ -82,7 +91,7 @@ const adminMiddleware = async (c: AppContext, next: Next) => {
     return c.json({ error: '未授权访问' }, 401);
   }
 
-  const session = await validateSession(c.env.DB, token);
+  const session = await validateSession(c.env.DB, c.env.SESSION_KV, token);
   if (!session) {
     return c.json({ error: 'Session 已过期，请重新登录' }, 401);
   }
@@ -95,16 +104,120 @@ const adminMiddleware = async (c: AppContext, next: Next) => {
   await next();
 };
 
-// ========== R2 静态文件服务 (带 CDN 缓存) ==========
+// ========== 私有图片鉴权缓存 ==========
+const AUTH_CACHE_TTL = 5 * 60; // 5分钟
+
+interface AuthCacheResult {
+  userId: number;
+  isAllowed: boolean;
+}
+
+// 检查鉴权缓存
+async function checkAuthCache(token: string, imageId: string): Promise<AuthCacheResult | null> {
+  const cache = caches.default;
+  const cacheKey = new Request(`https://auth-cache/${token}/${imageId}`);
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return cached.json();
+  }
+  return null;
+}
+
+// 设置鉴权缓存
+async function setAuthCache(token: string, imageId: string, result: AuthCacheResult): Promise<void> {
+  const cache = caches.default;
+  const cacheKey = new Request(`https://auth-cache/${token}/${imageId}`);
+  const response = new Response(JSON.stringify(result), {
+    headers: { 'Cache-Control': `max-age=${AUTH_CACHE_TTL}` }
+  });
+  await cache.put(cacheKey, response);
+}
+
+// ========== R2 静态文件服务 (带访问控制) ==========
+// 用户生成的图片通过 token 验证访问权限
 app.get('/r2/*', async (c) => {
   const key = c.req.path.slice(4); // 去掉 /r2/ 前缀
+
+  // 判断是否是用户生成的图片（需要访问控制）
+  const isUserImage = key.startsWith('images/');
+
+  if (isUserImage) {
+    // 从路径提取 imageId: images/{imageId}.png 或 images/{imageId}_thumb.webp
+    const filename = key.split('/').pop() || '';
+    const imageId = filename.split('.')[0].replace('_thumb', '');
+
+    // 查询图片信息
+    const image = await imageDb.getById(c.env.DB, imageId);
+
+    if (!image) {
+      return c.json({ error: 'Image not found' }, 404);
+    }
+
+    // 如果图片不是公开的，需要验证身份
+    if (!image.isPublic) {
+      // 支持 query param 中的 token（用于 <img> 标签）
+      const queryToken = c.req.query('token');
+      const headerToken = extractToken(c.req.header('Authorization'));
+      const token = queryToken || headerToken;
+
+      if (!token) {
+        return c.json({ error: '需要登录才能查看此图片' }, 401);
+      }
+
+      // 先检查鉴权缓存
+      const cachedAuth = await checkAuthCache(token, imageId);
+
+      if (cachedAuth) {
+        // 缓存命中
+        if (!cachedAuth.isAllowed) {
+          return c.json({ error: '无权查看此图片' }, 403);
+        }
+        // 缓存命中且有权访问，继续返回图片
+      } else {
+        // 缓存未命中，验证 session
+        const session = await validateSession(c.env.DB, c.env.SESSION_KV, token);
+        if (!session) {
+          return c.json({ error: '登录已过期' }, 401);
+        }
+
+        // 验证是否是图片所有者或管理员
+        const isAllowed = session.userId === image.userId || session.role === 'admin';
+
+        // 异步写入缓存（不阻塞响应）
+        c.executionCtx.waitUntil(setAuthCache(token, imageId, {
+          userId: session.userId!,
+          isAllowed
+        }));
+
+        if (!isAllowed) {
+          return c.json({ error: '无权查看此图片' }, 403);
+        }
+      }
+
+      // 私有图片不缓存到 CDN
+      const object = await getImage(c.env.R2, key);
+      if (!object) {
+        return c.json({ error: 'File not found' }, 404);
+      }
+
+      const headers = new Headers();
+      object.writeHttpMetadata(headers);
+      headers.set('etag', object.httpEtag);
+      headers.set('Cache-Control', 'private, no-store');
+      headers.set('Access-Control-Allow-Origin', '*');
+      headers.set('X-Auth-Cache', cachedAuth ? 'HIT' : 'MISS');
+
+      return new Response(object.body, { headers });
+    }
+  }
+
+  // 公开图片或资源文件，使用 CDN 缓存
   const cacheKey = new Request(c.req.url, c.req.raw);
   const cache = caches.default;
 
   // 检查 CDN 缓存
   let response = await cache.match(cacheKey);
   if (response) {
-    // 添加缓存命中标记
     const cachedResponse = new Response(response.body, response);
     cachedResponse.headers.set('X-Cache', 'HIT');
     return cachedResponse;
@@ -120,13 +233,9 @@ app.get('/r2/*', async (c) => {
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set('etag', object.httpEtag);
-  // 设置长期缓存 (1年，资产内容不变)
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  // 允许 CORS（中国用户可能需要）
   headers.set('Access-Control-Allow-Origin', '*');
-  // 缓存未命中标记
   headers.set('X-Cache', 'MISS');
-  // 告诉 Cloudflare 缓存这个响应
   headers.set('CDN-Cache-Control', 'public, max-age=31536000');
 
   response = new Response(object.body, { headers });
@@ -138,66 +247,75 @@ app.get('/r2/*', async (c) => {
 });
 
 // ========== 认证 API ==========
-app.post('/api/auth/register', rateLimit(3, 5 * 60 * 1000), async (c) => {
-  try {
-    const { username, password } = await c.req.json();
-
-    if (!username || !password) {
-      return c.json({ error: '请提供用户名和密码' }, 400);
+app.post('/api/auth/register',
+  rateLimit(3, 5 * 60 * 1000),
+  zValidator('json', registerSchema, (result, c) => {
+    if (!result.success) {
+      return c.json({ error: getFirstError(result.error) }, 400);
     }
+  }),
+  async (c) => {
+    try {
+      const { username, password } = c.req.valid('json');
 
-    const result = await register(c.env.DB, username, password);
-    if ('error' in result) {
-      return c.json({ error: result.error }, 400);
+      const result = await register(c.env.DB, c.env.SESSION_KV, username, password);
+      if ('error' in result) {
+        return c.json({ error: result.error }, 400);
+      }
+
+      return c.json({
+        success: true,
+        token: result.token,
+        user: result.user,
+        expiresAt: result.expiresAt
+      });
+    } catch (error) {
+      console.error('Register error:', error);
+      return c.json({ error: '注册失败，请稍后重试' }, 500);
     }
-
-    return c.json({
-      success: true,
-      token: result.token,
-      user: result.user,
-      expiresAt: result.expiresAt
-    });
-  } catch (error) {
-    console.error('Register error:', error);
-    return c.json({ error: '注册失败，请稍后重试' }, 500);
   }
-});
+);
 
-app.post('/api/auth/login', rateLimit(5, 60 * 1000), async (c) => {
-  try {
-    const { username, password } = await c.req.json();
-
-    if (!username || !password) {
-      return c.json({ error: '请提供用户名和密码' }, 400);
+app.post('/api/auth/login',
+  rateLimit(5, 60 * 1000),
+  zValidator('json', loginSchema, (result, c) => {
+    if (!result.success) {
+      return c.json({ error: getFirstError(result.error) }, 400);
     }
+  }),
+  async (c) => {
+    try {
+      const { username, password } = c.req.valid('json');
 
-    const result = await login(
-      c.env.DB,
-      username,
-      password,
-      c.env.ADMIN_USERNAME,
-      c.env.ADMIN_PASSWORD
-    );
+      const result = await login(
+        c.env.DB,
+        c.env.SESSION_KV,
+        username,
+        password,
+        c.env.ADMIN_USERNAME,
+        c.env.ADMIN_PASSWORD
+      );
 
-    if (!result) {
-      return c.json({ error: '用户名或密码错误' }, 401);
+      if (!result) {
+        return c.json({ error: '用户名或密码错误' }, 401);
+      }
+
+      return c.json({
+        success: true,
+        token: result.token,
+        user: result.user,
+        expiresAt: result.expiresAt
+      });
+    } catch (error) {
+      console.error('Login error:', error);
+      return c.json({ error: '登录失败，请稍后重试' }, 500);
     }
-
-    return c.json({
-      success: true,
-      token: result.token,
-      user: result.user,
-      expiresAt: result.expiresAt
-    });
-  } catch (error) {
-    console.error('Login error:', error);
-    return c.json({ error: '登录失败，请稍后重试' }, 500);
   }
-});
+);
 
 app.post('/api/auth/logout', authMiddleware, async (c) => {
   const token = extractToken(c.req.header('Authorization') || null)!;
-  await logout(c.env.DB, token);
+  await logout(c.env.DB, c.env.SESSION_KV, token);
   return c.json({ success: true });
 });
 
@@ -213,30 +331,34 @@ app.get('/api/auth/verify', authMiddleware, async (c) => {
   });
 });
 
-app.post('/api/auth/change-password', authMiddleware, async (c) => {
-  try {
-    const user = c.get('user');
-    const { oldPassword, newPassword } = await c.req.json();
-
-    if (!oldPassword || !newPassword) {
-      return c.json({ error: '请提供当前密码和新密码' }, 400);
+app.post('/api/auth/change-password',
+  authMiddleware,
+  zValidator('json', changePasswordSchema, (result, c) => {
+    if (!result.success) {
+      return c.json({ error: getFirstError(result.error) }, 400);
     }
+  }),
+  async (c) => {
+    try {
+      const user = c.get('user');
+      const { oldPassword, newPassword } = c.req.valid('json');
 
-    if (user.role === 'admin' && !user.userId) {
-      return c.json({ error: '管理员账户请通过环境变量修改密码' }, 400);
+      if (user.role === 'admin' && !user.userId) {
+        return c.json({ error: '管理员账户请通过环境变量修改密码' }, 400);
+      }
+
+      const result = await changePassword(c.env.DB, user.userId!, oldPassword, newPassword);
+      if ('error' in result) {
+        return c.json({ error: result.error }, 400);
+      }
+
+      return c.json({ success: true, message: '密码修改成功' });
+    } catch (error) {
+      console.error('Change password error:', error);
+      return c.json({ error: '密码修改失败，请稍后重试' }, 500);
     }
-
-    const result = await changePassword(c.env.DB, user.userId!, oldPassword, newPassword);
-    if ('error' in result) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json({ success: true, message: '密码修改成功' });
-  } catch (error) {
-    console.error('Change password error:', error);
-    return c.json({ error: '密码修改失败，请稍后重试' }, 500);
   }
-});
+);
 
 // ========== 标签 API ==========
 app.get('/api/tags', async (c) => {
@@ -1521,6 +1643,24 @@ app.get('/api/health', async (c) => {
 });
 
 // ========== Cron 触发器（定时清理） ==========
+// 导出 Durable Object 类
+export { TaskMonitor } from './do/TaskMonitor';
+
+// ========== WebSocket API ==========
+app.get('/api/ws/task/:taskId', async (c) => {
+  const upgradeHeader = c.req.header('Upgrade');
+  if (!upgradeHeader || upgradeHeader !== 'websocket') {
+    return c.text('Expected Upgrade: websocket', 426);
+  }
+
+  const taskId = c.req.param('taskId');
+  const id = c.env.TASK_MONITOR.idFromName(taskId);
+  const stub = c.env.TASK_MONITOR.get(id);
+
+  return stub.fetch(c.req.raw);
+});
+
+
 export default {
   fetch: app.fetch,
 
